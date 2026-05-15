@@ -6,6 +6,7 @@ defmodule Tuist.Automations.Workers.AlertEvaluationWorker do
 
   alias Tuist.Automations
   alias Tuist.Automations.ActionExecutor
+  alias Tuist.Automations.Alerts.Alert
   alias Tuist.Automations.Monitors.FlakyTestsMonitor
   alias Tuist.ClickHouseRepo
   alias Tuist.Tests.TestCaseRun
@@ -194,7 +195,7 @@ defmodule Tuist.Automations.Workers.AlertEvaluationWorker do
     end)
   end
 
-  defp parse_rolling_size(size) when is_integer(size) and size > 0, do: size
+  defp parse_rolling_size(size) when is_integer(size) and size > 0, do: min(size, Alert.max_rolling_window_size())
   defp parse_rolling_size(_), do: 100
 
   defp parse_window(window) when is_binary(window) do

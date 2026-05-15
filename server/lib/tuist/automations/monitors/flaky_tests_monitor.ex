@@ -31,12 +31,12 @@ defmodule Tuist.Automations.Monitors.FlakyTestsMonitor do
   `(test_run_id, …)` and would have to filter `project_id` after reading
   every granule in the relevant monthly partitions).
 
-  The `rolling` mode reads `test_case_runs_recent_per_case`, an
-  `AggregatingMergeTree` MV that maintains a `groupArrayLast(N)` aggregate
-  of `(ran_at, is_flaky)` tuples per `(project_id, test_case_id)`. A
-  project's whole rolling-window scan becomes one row per active test
-  case, regardless of run volume — reading raw `test_case_runs` for that
-  pattern is unrunnable on busy projects.
+  The `rolling` mode reads bucketed `test_case_runs_recent_N_per_case`
+  `AggregatingMergeTree` MVs for common windows and falls back to
+  `test_case_runs_recent_per_case` for larger windows. A project's whole
+  rolling-window scan becomes one row per active test case, regardless of run
+  volume — reading raw `test_case_runs` for that pattern is unrunnable on busy
+  projects.
   """
   import Ecto.Query
 
@@ -46,11 +46,11 @@ defmodule Tuist.Automations.Monitors.FlakyTestsMonitor do
 
   @comparisons ~w(gte gt lt lte)
 
-  # Matches the `groupArrayLast(N)` cap baked into
-  # `test_case_runs_recent_per_case_mv` and the `Alert.changeset/2`
-  # validation. If we ever raise the user-facing cap, all three sites need to
-  # move together.
+  # Product cap shared with `Alert.changeset/2`; larger values are rejected at
+  # write time. Common windows use the smaller recent-runs MV fast path below.
   @max_rolling_window_size 1000
+  @default_rolling_window_size 100
+  @recent_runs_bucket_sizes [100, 250, 500, 750]
 
   def evaluate(alert) do
     trigger_config = alert.trigger_config
@@ -207,41 +207,84 @@ defmodule Tuist.Automations.Monitors.FlakyTestsMonitor do
     )
   end
 
-  # The rolling path reads `test_case_runs_recent_per_case_mv`, which
-  # maintains a `groupArrayLast` aggregate of `(ran_at, is_flaky)` tuples per
-  # `(project_id, test_case_id)`, capped at `@max_rolling_window_size`
-  # entries. Reading raw `test_case_runs` here doesn't scale: even with a
-  # 30-day lookback and `LIMIT N BY`, the query has to walk every run in the
-  # project's lookback (200M+ rows on busy projects) because the table's
-  # primary key prefix doesn't fit "last N runs per test case per project."
+  # The rolling fast path reads `test_case_runs_recent_N_per_case`, where N is
+  # the smallest bucket in `@recent_runs_bucket_sizes` that can satisfy the
+  # configured window. These tables maintain `groupArraySorted` aggregates of
+  # `(-ran_at_microseconds, is_flaky)` tuples per `(project_id, test_case_id)`.
+  # The full `test_case_runs_recent_per_case` aggregate still keeps 1000
+  # entries for larger user-configured windows, but common/default windows do
+  # not have to deserialize that larger state.
   #
   # The MV scan is bounded by `active_test_cases_in_project` rather than
-  # total run volume — usually a few thousand rows. We sort the per-row
-  # array by `ran_at` DESC at read time so the user-facing semantic stays
-  # exact "last N by ran_at" rather than "last N by insertion order."
+  # total run volume — usually a few thousand rows. The per-row aggregate is
+  # sorted by `-ran_at_microseconds`, so the merged array is already
+  # latest-first before the final user-configured slice.
   #
   # ReplacingMergeTree dedup on `test_case_runs` happens after the MV has
   # already absorbed the row, so a re-inserted run (e.g. is_flaky updated
-  # later) appears twice in the `groupArrayLast` array. That's bounded
+  # later) appears twice in the bounded recent-runs array. That's bounded
   # noise — ≤1% at the default window — well within the natural variance
   # of a flakiness threshold.
   #
-  # `monitor_type` and `comparison` are interpolated because each is
-  # constrained to a fixed allowlist, so there is no SQL-injection vector.
-  # Numeric inputs (`project_id`, `size`, `threshold`) flow through bound
-  # parameters.
+  # `monitor_type`, `comparison`, `table`, and `recent_n_expr` are
+  # interpolated because they are chosen from fixed in-module allowlists, so
+  # there is no SQL-injection vector. Numeric inputs (`project_id`, `size`,
+  # `threshold`) flow through bound parameters.
   defp rolling_triggered_test_case_ids(project_id, monitor_type, size, threshold, comparison) do
+    {table, recent_n_expr} =
+      case Enum.find(@recent_runs_bucket_sizes, &(size <= &1)) do
+        nil ->
+          {
+            "test_case_runs_recent_per_case",
+            """
+            arraySlice(
+              arrayReverseSort(x -> x.1, groupArrayLastMerge(#{@max_rolling_window_size})(recent_runs)),
+              1,
+              {size:UInt32}
+            )
+            """
+          }
+
+        bucket_size ->
+          {
+            "test_case_runs_recent_#{bucket_size}_per_case",
+            """
+            arraySlice(
+              groupArraySortedMerge(#{bucket_size})(recent_runs),
+              1,
+              {size:UInt32}
+            )
+            """
+          }
+      end
+
+    rolling_triggered_test_case_ids_from_recent_runs(
+      table,
+      recent_n_expr,
+      project_id,
+      monitor_type,
+      size,
+      threshold,
+      comparison
+    )
+  end
+
+  defp rolling_triggered_test_case_ids_from_recent_runs(
+         table,
+         recent_n_expr,
+         project_id,
+         monitor_type,
+         size,
+         threshold,
+         comparison
+       ) do
     sql = """
     SELECT test_case_id
     FROM (
       SELECT
         test_case_id,
-        arraySlice(
-          arrayReverseSort(x -> x.1, groupArrayLastMerge(#{@max_rolling_window_size})(recent_runs)),
-          1,
-          {size:UInt32}
-        ) AS recent_n
-      FROM test_case_runs_recent_per_case
+        #{recent_n_expr} AS recent_n
+      FROM #{table}
       WHERE project_id = {project_id:Int64}
       GROUP BY test_case_id
     )
@@ -313,8 +356,8 @@ defmodule Tuist.Automations.Monitors.FlakyTestsMonitor do
 
   defp parse_window(_), do: 30 * 86_400
 
-  defp parse_rolling_size(size) when is_integer(size) and size > 0, do: size
-  defp parse_rolling_size(_), do: 100
+  defp parse_rolling_size(size) when is_integer(size) and size > 0, do: min(size, @max_rolling_window_size)
+  defp parse_rolling_size(_), do: @default_rolling_window_size
 
   # `gte` is the historical default before alerts had a comparison field; keep
   # it as the fallback so existing alerts don't change behaviour.
